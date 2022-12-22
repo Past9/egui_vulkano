@@ -8,92 +8,106 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use bytemuck::{Pod, Zeroable};
-use egui::plot::{HLine, Line, Plot, Value, Values};
-use egui::{Color32, ColorImage, Ui};
+use egui::plot::{HLine, Line, Plot, PlotPoint, PlotPoints};
+use egui::{Color32, ColorImage, TextureOptions, Ui};
 use egui_vulkano::UpdateTexturesResult;
 use vulkano::buffer::{BufferUsage, CpuAccessibleBuffer, TypedBufferAccess};
-use vulkano::command_buffer::{AutoCommandBufferBuilder, CommandBufferUsage, SubpassContents};
+use vulkano::command_buffer::allocator::StandardCommandBufferAllocator;
+use vulkano::command_buffer::{
+    AutoCommandBufferBuilder, CommandBufferUsage, RenderPassBeginInfo, SubpassContents,
+};
 use vulkano::device::physical::{PhysicalDevice, PhysicalDeviceType};
-use vulkano::device::{Device, DeviceCreateInfo, DeviceExtensions, QueueCreateInfo};
-use vulkano::format::Format;
+use vulkano::device::{Device, DeviceCreateInfo, DeviceExtensions, QueueCreateInfo, QueueFlags};
+use vulkano::format::{ClearValue, Format};
 use vulkano::image::view::ImageView;
 use vulkano::image::{ImageAccess, ImageUsage, SwapchainImage};
-use vulkano::instance::{Instance, InstanceCreateInfo};
+use vulkano::instance::debug::{DebugUtilsMessenger, DebugUtilsMessengerCreateInfo};
+use vulkano::instance::{Instance, InstanceCreateInfo, InstanceExtensions};
+use vulkano::memory::allocator::StandardMemoryAllocator;
 use vulkano::pipeline::graphics::input_assembly::InputAssemblyState;
 use vulkano::pipeline::graphics::vertex_input::BuffersDefinition;
 use vulkano::pipeline::graphics::viewport::Viewport;
 use vulkano::pipeline::graphics::viewport::ViewportState;
 use vulkano::pipeline::GraphicsPipeline;
 use vulkano::render_pass::{Framebuffer, FramebufferCreateInfo, RenderPass, Subpass};
-use vulkano::swapchain::{AcquireError, Swapchain, SwapchainCreateInfo, SwapchainCreationError};
+use vulkano::swapchain::{
+    AcquireError, Swapchain, SwapchainCreateInfo, SwapchainCreationError, SwapchainPresentInfo,
+};
 use vulkano::sync::{FenceSignalFuture, FlushError, GpuFuture};
-use vulkano::{swapchain, sync};
+use vulkano::{swapchain, sync, VulkanLibrary};
 use vulkano_win::VkSurfaceBuild;
 use winit::event::{Event, WindowEvent};
 use winit::event_loop::{ControlFlow, EventLoop};
 use winit::window::{Fullscreen, Window, WindowBuilder};
 
-pub enum FrameEndFuture<F: GpuFuture + 'static> {
-    FenceSignalFuture(FenceSignalFuture<F>),
-    BoxedFuture(Box<dyn GpuFuture>),
-}
+pub struct FrameEndFuture(Box<dyn GpuFuture>);
 
-impl<F: GpuFuture> FrameEndFuture<F> {
+impl FrameEndFuture {
     pub fn now(device: Arc<Device>) -> Self {
-        Self::BoxedFuture(sync::now(device).boxed())
+        Self(sync::now(device).boxed())
     }
 
     pub fn get(self) -> Box<dyn GpuFuture> {
-        match self {
-            FrameEndFuture::FenceSignalFuture(f) => f.boxed(),
-            FrameEndFuture::BoxedFuture(f) => f,
-        }
+        self.0
     }
 }
 
-impl<F: GpuFuture> AsMut<dyn GpuFuture> for FrameEndFuture<F> {
+impl AsMut<dyn GpuFuture> for FrameEndFuture {
     fn as_mut(&mut self) -> &mut (dyn GpuFuture + 'static) {
-        match self {
-            FrameEndFuture::FenceSignalFuture(f) => f,
-            FrameEndFuture::BoxedFuture(f) => f,
-        }
+        self.0.as_mut()
     }
 }
 
 fn main() {
-    let required_extensions = vulkano_win::required_extensions();
-    let instance = Instance::new(InstanceCreateInfo {
-        enabled_extensions: required_extensions,
-        ..Default::default()
-    })
+    let library = VulkanLibrary::new().unwrap();
+    let required_extensions = vulkano_win::required_extensions(&library);
+
+    let instance = Instance::new(
+        library,
+        InstanceCreateInfo {
+            enabled_extensions: required_extensions,
+            enabled_layers: vec!["VK_LAYER_KHRONOS_validation".into()],
+            ..Default::default()
+        },
+    )
     .unwrap();
-
-    let physical = PhysicalDevice::enumerate(&instance).next().unwrap();
-
-    println!(
-        "Using device: {} (type: {:?})",
-        physical.properties().device_name,
-        physical.properties().device_type,
-    );
+    let _callback = unsafe {
+        DebugUtilsMessenger::new(
+            instance.clone(),
+            DebugUtilsMessengerCreateInfo::user_callback(Arc::new(|msg| {
+                println!("Debug callback: {:?}", msg.description);
+            })),
+        )
+        .ok()
+    };
 
     let event_loop = EventLoop::new();
     let surface = WindowBuilder::new()
         .with_title("egui_vulkano demo")
-        .with_fullscreen(Some(Fullscreen::Borderless(None)))
+        //.with_fullscreen(Some(Fullscreen::Borderless(None)))
         .build_vk_surface(&event_loop, instance.clone())
         .unwrap();
 
     let device_extensions = DeviceExtensions {
         khr_swapchain: true,
-        ..DeviceExtensions::none()
+        ..DeviceExtensions::empty()
     };
 
-    let (physical_device, queue_family) = PhysicalDevice::enumerate(&instance)
-        .filter(|&p| p.supported_extensions().is_superset_of(&device_extensions))
+    let (physical_device, queue_family_index) = instance
+        .enumerate_physical_devices()
+        .unwrap()
+        .filter(|p| p.supported_extensions().contains(&device_extensions))
         .filter_map(|p| {
-            p.queue_families()
-                .find(|&q| q.supports_graphics() && q.supports_surface(&surface).unwrap_or(false))
-                .map(|q| (p, q))
+            p.queue_family_properties()
+                .iter()
+                .enumerate()
+                .position(|(i, q)| {
+                    q.queue_flags.intersects(&QueueFlags {
+                        graphics: true,
+                        ..Default::default()
+                    }) && p.surface_support(i as u32, &surface).unwrap_or(false)
+                })
+                .map(|i| (p, i as u32))
         })
         .min_by_key(|(p, _)| match p.properties().device_type {
             PhysicalDeviceType::DiscreteGpu => 0,
@@ -101,20 +115,26 @@ fn main() {
             PhysicalDeviceType::VirtualGpu => 2,
             PhysicalDeviceType::Cpu => 3,
             PhysicalDeviceType::Other => 4,
+            _ => 5,
         })
         .unwrap();
 
     let (device, mut queues) = Device::new(
-        physical_device,
+        physical_device.clone(),
         DeviceCreateInfo {
-            enabled_extensions: physical_device
-                .required_extensions()
-                .union(&device_extensions),
-            queue_create_infos: vec![QueueCreateInfo::family(queue_family)],
+            enabled_extensions: device_extensions,
+            queue_create_infos: vec![QueueCreateInfo {
+                queue_family_index,
+                ..Default::default()
+            }],
             ..Default::default()
         },
     )
     .unwrap();
+
+    let standard_memory_allocator = StandardMemoryAllocator::new_default(device.clone());
+    let command_buffer_allocator =
+        StandardCommandBufferAllocator::new(device.clone(), Default::default());
 
     let queue = queues.next().unwrap();
 
@@ -125,7 +145,8 @@ fn main() {
         let composite_alpha = caps.supported_composite_alpha.iter().next().unwrap();
 
         let image_format = Some(Format::B8G8R8A8_SRGB);
-        let image_extent: [u32; 2] = surface.window().inner_size().into();
+
+        let window = surface.object().unwrap().downcast_ref::<Window>().unwrap();
 
         Swapchain::new(
             device.clone(),
@@ -133,8 +154,11 @@ fn main() {
             SwapchainCreateInfo {
                 min_image_count: caps.min_image_count,
                 image_format,
-                image_extent,
-                image_usage: ImageUsage::color_attachment(),
+                image_extent: window.inner_size().into(),
+                image_usage: ImageUsage {
+                    color_attachment: true,
+                    ..Default::default()
+                },
                 composite_alpha,
 
                 ..Default::default()
@@ -152,8 +176,11 @@ fn main() {
 
     let vertex_buffer = {
         CpuAccessibleBuffer::from_iter(
-            device.clone(),
-            BufferUsage::all(),
+            &standard_memory_allocator,
+            BufferUsage {
+                vertex_buffer: true,
+                ..Default::default()
+            },
             false,
             [
                 Vertex {
@@ -242,17 +269,19 @@ fn main() {
 
     let mut recreate_swapchain = false;
 
-    let mut previous_frame_end = Some(FrameEndFuture::now(device.clone()));
+    let mut previous_frame_end: Option<Box<dyn GpuFuture>> =
+        Some(sync::now(device.clone()).boxed());
 
     //Set up everything need to draw the gui
-    let window = surface.window();
     let egui_ctx = egui::Context::default();
-    let mut egui_winit = egui_winit::State::new(4096, window);
+    let mut egui_winit = egui_winit::State::new(&event_loop);
 
     let mut egui_painter = egui_vulkano::Painter::new(
         device.clone(),
         queue.clone(),
         Subpass::from(render_pass.clone(), 1).unwrap(),
+        standard_memory_allocator,
+        command_buffer_allocator,
     )
     .unwrap();
 
@@ -261,7 +290,11 @@ fn main() {
     let mut egui_test = egui_demo_lib::ColorTest::default();
     let mut demo_windows = egui_demo_lib::DemoWindows::default();
     let mut egui_bench = Benchmark::new(1000);
-    let mut my_texture = egui_ctx.load_texture("my_texture", ColorImage::example());
+    let mut my_texture = egui_ctx.load_texture(
+        "my_texture",
+        ColorImage::example(),
+        TextureOptions::default(),
+    );
 
     event_loop.run(move |event, _, control_flow| {
         match event {
@@ -279,7 +312,7 @@ fn main() {
             }
             Event::WindowEvent { event, .. } => {
                 let egui_consumed_event = egui_winit.on_event(&egui_ctx, &event);
-                if !egui_consumed_event {
+                if !egui_consumed_event.consumed {
                     // do your own event handling here
                 };
             }
@@ -290,11 +323,17 @@ fn main() {
                     .as_mut()
                     .cleanup_finished();
 
+                let window = surface.object().unwrap().downcast_ref::<Window>().unwrap();
+
                 if recreate_swapchain {
-                    let dimensions: [u32; 2] = surface.window().inner_size().into();
+                    let dimensions = window.inner_size();
+                    if dimensions.width == 0 || dimensions.height == 0 {
+                        return;
+                    }
+
                     let (new_swapchain, new_images) =
                         match swapchain.recreate(SwapchainCreateInfo {
-                            image_extent: surface.window().inner_size().into(),
+                            image_extent: dimensions.into(),
                             ..swapchain.create_info()
                         }) {
                             Ok(r) => r,
@@ -308,7 +347,7 @@ fn main() {
                         render_pass.clone(),
                         &mut viewport,
                     );
-                    viewport.dimensions = [dimensions[0] as f32, dimensions[1] as f32];
+                    viewport.dimensions = [dimensions.width as f32, dimensions.height as f32];
                     recreate_swapchain = false;
                 }
 
@@ -326,16 +365,19 @@ fn main() {
                     recreate_swapchain = true;
                 }
 
-                let clear_values = vec![[0.0, 0.0, 1.0, 1.0].into()];
+                let command_buffer_allocator =
+                    StandardCommandBufferAllocator::new(device.clone(), Default::default());
+
+                let clear_values = vec![ClearValue::Float([0.0, 0.0, 1.0, 1.0]).into()];
                 let mut builder = AutoCommandBufferBuilder::primary(
-                    device.clone(),
-                    queue.family(),
+                    egui_painter.command_buffer_allocator(),
+                    queue.queue_family_index(),
                     CommandBufferUsage::OneTimeSubmit,
                 )
                 .unwrap();
 
                 let frame_start = Instant::now();
-                egui_ctx.begin_frame(egui_winit.take_egui_input(surface.window()));
+                egui_ctx.begin_frame(egui_winit.take_egui_input(window));
                 demo_windows.ui(&egui_ctx);
 
                 egui::Window::new("Color test")
@@ -358,27 +400,33 @@ fn main() {
                     ui.image(my_texture.id(), (200.0, 200.0));
                     if ui.button("Reload texture").clicked() {
                         // previous TextureHandle is dropped, causing egui to free the texture:
-                        my_texture = egui_ctx.load_texture("my_texture", ColorImage::example());
+                        my_texture = egui_ctx.load_texture(
+                            "my_texture",
+                            ColorImage::example(),
+                            TextureOptions::default(),
+                        );
                     }
                 });
 
                 // Get the shapes from egui
                 let egui_output = egui_ctx.end_frame();
                 let platform_output = egui_output.platform_output;
-                egui_winit.handle_platform_output(surface.window(), &egui_ctx, platform_output);
+                egui_winit.handle_platform_output(window, &egui_ctx, platform_output);
 
-                let result = egui_painter
-                    .update_textures(egui_output.textures_delta, &mut builder)
+                let tex_future = egui_painter
+                    .update_textures(egui_output.textures_delta)
                     .expect("egui texture error");
-
-                let wait_for_last_frame = result == UpdateTexturesResult::Changed;
 
                 // Do your usual rendering
                 builder
                     .begin_render_pass(
-                        framebuffers[image_num].clone(),
+                        RenderPassBeginInfo {
+                            clear_values,
+                            ..RenderPassBeginInfo::framebuffer(
+                                framebuffers[image_num as usize].clone(),
+                            )
+                        },
                         SubpassContents::Inline,
-                        clear_values,
                     )
                     .unwrap()
                     .set_viewport(0, [viewport.clone()])
@@ -390,12 +438,13 @@ fn main() {
                 // Build your gui
 
                 // Automatically start the next render subpass and draw the gui
-                let size = surface.window().inner_size();
-                let sf: f32 = surface.window().scale_factor() as f32;
+                let size = window
+                    .inner_size()
+                    .to_logical(egui_ctx.pixels_per_point() as _);
                 egui_painter
                     .draw(
                         &mut builder,
-                        [(size.width as f32) / sf, (size.height as f32) / sf],
+                        [size.width, size.height],
                         &egui_ctx,
                         egui_output.shapes,
                     )
@@ -407,34 +456,32 @@ fn main() {
                 builder.end_render_pass().unwrap();
 
                 let command_buffer = builder.build().unwrap();
-
-                if wait_for_last_frame {
-                    if let Some(FrameEndFuture::FenceSignalFuture(ref mut f)) = previous_frame_end {
-                        f.wait(None).unwrap();
-                    }
+                let mut future_mut = acquire_future.join(tex_future).boxed();
+                if let Some(future) = previous_frame_end.take() {
+                    future_mut = future_mut.join(future).boxed();
                 }
 
-                let future = previous_frame_end
-                    .take()
-                    .unwrap()
-                    .get()
-                    .join(acquire_future)
+                let future = future_mut
                     .then_execute(queue.clone(), command_buffer)
                     .unwrap()
-                    .then_swapchain_present(queue.clone(), swapchain.clone(), image_num)
+                    .then_swapchain_present(
+                        queue.clone(),
+                        SwapchainPresentInfo::swapchain_image_index(swapchain.clone(), image_num),
+                    )
                     .then_signal_fence_and_flush();
 
                 match future {
                     Ok(future) => {
-                        previous_frame_end = Some(FrameEndFuture::FenceSignalFuture(future));
+                        future.wait(None).unwrap();
+                        previous_frame_end = Some(sync::now(device.clone()).boxed());
                     }
                     Err(FlushError::OutOfDate) => {
                         recreate_swapchain = true;
-                        previous_frame_end = Some(FrameEndFuture::now(device.clone()));
+                        previous_frame_end = Some(sync::now(device.clone()).boxed());
                     }
                     Err(e) => {
                         println!("Failed to flush future: {:?}", e);
-                        previous_frame_end = Some(FrameEndFuture::now(device.clone()));
+                        previous_frame_end = Some(sync::now(device.clone()).boxed());
                     }
                 }
             }
@@ -443,8 +490,9 @@ fn main() {
     });
 }
 
+/// This method is called once during initialization, then again whenever the window is resized
 fn window_size_dependent_setup(
-    images: &[Arc<SwapchainImage<Window>>],
+    images: &[Arc<SwapchainImage>],
     render_pass: Arc<RenderPass>,
     viewport: &mut Viewport,
 ) -> Vec<Arc<Framebuffer>> {
@@ -485,8 +533,8 @@ impl Benchmark {
             .data
             .iter()
             .enumerate()
-            .map(|(i, v)| Value::new(i as f64, *v * 1000.0));
-        let curve = Line::new(Values::from_values_iter(iter)).color(Color32::BLUE);
+            .map(|(i, v)| [i as f64, *v * 1000.0]);
+        let curve = Line::new(PlotPoints::from_iter(iter)).color(Color32::BLUE);
         let target = HLine::new(1000.0 / 60.0).color(Color32::RED);
 
         ui.label("Time in milliseconds that the gui took to draw:");
